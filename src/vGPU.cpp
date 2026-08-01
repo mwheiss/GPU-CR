@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <mutex>
 #include <vector>
 #include <thread>
@@ -159,7 +160,7 @@ double ckpt() {
     double tot_size = 0;
     
     auto time_start = std::chrono::high_resolution_clock::now();
-    long sync_time = 0, cpu_copy_time = 0, release_time = 0;
+    long submit_time = 0, sync_time = 0, cpu_copy_time = 0, release_time = 0;
 
     void* tmp_buf = backend->get_tmp_buf();
     fprintf(stderr, "[vGPU-CKPT] tmp_buf=%p\n", tmp_buf);
@@ -221,7 +222,12 @@ double ckpt() {
             size_t cur_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
             void* start_addr = (char*)staging_buf[current_buf & 1] + buf_offset;
             
-            if (gpu->memcpyAsync(start_addr, d, cur_size, GPUMemcpyKind::DeviceToHost, stream) != 0) {
+            auto tm1 = std::chrono::high_resolution_clock::now();
+            int memcpy_rc = gpu->memcpyAsync(start_addr, d, cur_size,
+                                             GPUMemcpyKind::DeviceToHost, stream);
+            auto tm2 = std::chrono::high_resolution_clock::now();
+            submit_time += std::chrono::duration_cast<std::chrono::microseconds>(tm2 - tm1).count();
+            if (memcpy_rc != 0) {
                 fprintf(stderr, "Error: memcpyAsync failed\\n");
                 fs_mutex.unlock();
                 exit(-1);
@@ -296,6 +302,7 @@ double ckpt() {
     
 
     fprintf(stderr, "=== Checkpoint Timing Breakdown ===\n");
+    fprintf(stderr, "  GPU submit:       %6ld ms\n", submit_time / 1000);
     fprintf(stderr, "  GPU sync:         %6ld ms\n", sync_time / 1000);
     fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n", 
             cpu_copy_time / 1000,
@@ -314,7 +321,7 @@ double ckpt() {
 double restore_ptr_and_content() {
     double tot_size = 0;
     
-    long remap_time = 0, cpu_copy_time = 0, sync_time = 0;
+    long remap_time = 0, submit_time = 0, cpu_copy_time = 0, sync_time = 0;
     
     void* tmp_buf = backend->get_tmp_buf();
     shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
@@ -373,8 +380,14 @@ double restore_ptr_and_content() {
             size_t this_copy_size = std::min(size, (size_t)STAGING_BUF_SIZE - buf_offset);
             assert(buf_offset == offset - src_offset);
             
-            if (gpu->memcpyAsync(requestedAddr, (char*)staging_buf[current_buf & 1] + (offset - src_offset),
-                               this_copy_size, GPUMemcpyKind::HostToDevice, stream) != 0) {
+            auto tm1 = std::chrono::high_resolution_clock::now();
+            int memcpy_rc = gpu->memcpyAsync(
+                requestedAddr,
+                (char*)staging_buf[current_buf & 1] + (offset - src_offset),
+                this_copy_size, GPUMemcpyKind::HostToDevice, stream);
+            auto tm2 = std::chrono::high_resolution_clock::now();
+            submit_time += std::chrono::duration_cast<std::chrono::microseconds>(tm2 - tm1).count();
+            if (memcpy_rc != 0) {
                 fprintf(stderr, "Error: memcpyAsync failed\\n");
                 exit(-1);
             }
@@ -416,6 +429,7 @@ double restore_ptr_and_content() {
     
     fprintf(stderr, "=== Restore Timing Breakdown ===\n");
     fprintf(stderr, "  Remap memory:     %6ld ms\n", remap_time / 1000);
+    fprintf(stderr, "  GPU submit:       %6ld ms\n", submit_time / 1000);
     fprintf(stderr, "  CPU memcpy:       %6ld ms (%.2f GB/s)\n",
             cpu_copy_time / 1000,
             (tot_size / (1024.0*1024*1024)) / (cpu_copy_time / 1000000.0));
@@ -483,7 +497,19 @@ void init_CR() {
     if (gpu->registerHostMemory(tmp_buf_host, total_size) == 0) {
         fprintf(stderr, "[init_CR] Successfully registered as pinned memory\n");
     } else {
-        fprintf(stderr, "[init_CR] Note: Could not register as pinned (will use regular memory)\n");
+        const char* allow_pageable = std::getenv("GPU_CR_ALLOW_PAGEABLE_STAGING");
+        bool explicitly_allowed = allow_pageable &&
+            (!strcmp(allow_pageable, "1") || !strcasecmp(allow_pageable, "true"));
+        if (!explicitly_allowed) {
+            fprintf(stderr,
+                    "[init_CR] Error: CUDA staging memory is not pinned; refusing the "
+                    "known-slow pageable path. Set GPU_CR_ALLOW_PAGEABLE_STAGING=1 "
+                    "only for an explicit compatibility fallback.\n");
+            exit(EXIT_FAILURE);
+        }
+        fprintf(stderr,
+                "[init_CR] Warning: explicitly allowing unpinned staging; "
+                "checkpoint performance may be severely degraded\n");
     }
     
     for (int i = 0; i < STAGING_BUF_NUM; i++) {

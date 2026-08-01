@@ -100,35 +100,23 @@ void ShareMem::setup() {
     fs_mutex.unlock();
 
 
-    // host_buf — follow same backend selection as the main staging buffer.
-    if (use_file_backend) {
-        snprintf(shm_name, sizeof(shm_name), "%s/ckpt-%d-host.data", export_file_path, id);
-    } else {
-        snprintf(shm_name, sizeof(shm_name), "/mnt/huge-ckpt/%d-host", id);
-    }
-    fd_host = open(shm_name, O_CREAT | O_RDWR, 0755);
-    if (fd_host < 0) {
-        perror("open()");
-        exit(EXIT_FAILURE);
-    }
-    
+    // The host buffer is only a per-process CUDA transfer buffer.  It is not
+    // checkpoint state and must not inherit the persistent file backend.  In
+    // particular, cudaHostRegister rejects MAP_SHARED Btrfs file mappings on
+    // the tested NVIDIA stack; silently using that pageable mapping makes the
+    // nominally asynchronous transfers synchronous and throttles both paths.
+    // Anonymous mmap remains mmap-backed, but can be registered as pinned host
+    // memory.  The persistent/reclaimable allocation image stays in tmp_buf.
     size_t host_buf_total_size = STAGING_BUF_SIZE * STAGING_BUF_NUM;
-    if (ftruncate(fd_host, host_buf_total_size) < 0) {
-        perror("ftruncate() host mem");
-        exit(EXIT_FAILURE);
-    }
-    if (use_file_backend) {
-        reserve_file_capacity(fd_host, host_buf_total_size, shm_name);
-    }
-
-    host_buf_ptr = mmap(NULL, host_buf_total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_host, 0);
+    host_buf_ptr = mmap(NULL, host_buf_total_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (host_buf_ptr == MAP_FAILED) {
-        perror("mmap host mem failed");
+        perror("mmap anonymous host staging failed");
         exit(EXIT_FAILURE);
     }
-    close(fd_host);
-    fd_host = -1;
-    fprintf(stderr, "[ShareMem] Host memory mapped at %p (size: %zu)\n", host_buf_ptr, host_buf_total_size);
+    fprintf(stderr,
+            "[ShareMem] Anonymous host staging mapped at %p (size: %zu)\n",
+            host_buf_ptr, host_buf_total_size);
 
     
 }

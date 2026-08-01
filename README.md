@@ -166,7 +166,7 @@ To run multi-GPU at `gpu_memory_utilization=0.9`, also pass
 ### 1. Environment (single-GPU and multi-GPU)
 
 ```bash
-# Optional: file-based VRAM staging (instead of hugepages)
+# Optional: file-backed persistent VRAM checkpoint image (instead of hugepages)
 export EXPORT_FILE_PATH=/path/to/save/vram_dump_path
 
 # Recommended for speed: reserve hugepages
@@ -178,6 +178,23 @@ sudo chmod 777 /mnt/huge-ckpt
 # AMD-specific: where CRIU writes its checkpoint files
 export AMD_CKPT_DIR=/path/to/save/criu_files
 ```
+
+`EXPORT_FILE_PATH` affects only the persistent GPU-allocation image.  CUDA
+copies pass through a separate anonymous `mmap` transfer buffer, which GPU-CR
+registers as pinned host memory.  Keeping that temporary buffer on the regular
+filesystem can make `cudaHostRegister` fail and reduce otherwise memory-local
+restore throughput below the storage device's read rate.
+
+Pinned staging is required by default.  Initialization exits if host-memory
+registration fails so a production service cannot silently enter the known
+slow pageable path.  Set `GPU_CR_ALLOW_PAGEABLE_STAGING=1` only as an explicit
+compatibility fallback; it may severely degrade checkpoint and restore times.
+
+The file-backed image uses `MAP_SHARED`.  Linux may write dirty pages to the
+configured filesystem while retaining the resulting clean pages in page cache,
+so hot restores can remain memory-speed and the pages can still be reclaimed
+under pressure.  GPU-CR does not call `fsync`; applications that require
+power-loss durability must add their own persistence barrier.
 
 ### 2. Single-GPU run + checkpoint
 

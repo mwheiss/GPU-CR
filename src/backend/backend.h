@@ -16,7 +16,6 @@ class ShareMem : public Backend {
 public:
     void *tmp_buf = nullptr;
     void* host_buf_ptr = nullptr;
-    int fd_host = -1;
 
     std::mutex fs_mutex;
 
