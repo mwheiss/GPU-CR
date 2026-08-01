@@ -136,6 +136,15 @@ static double elapsed_sec(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double>(t1 - t0).count();
 }
 
+static long control_timeout_ms() {
+    const char* value = std::getenv("GPU_CR_CONTROL_TIMEOUT_MS");
+    if (!value || !*value) value = std::getenv("GPU_CR_LOCK_TIMEOUT_MS");
+    if (!value || !*value) return 600000;
+    char* end = nullptr;
+    long timeout = std::strtol(value, &end, 10);
+    return end != value && timeout > 0 ? timeout : 600000;
+}
+
 // ---------------------------------------------------------------------------
 // Per-process communication channels
 // ---------------------------------------------------------------------------
@@ -301,6 +310,17 @@ static void broadcast_and_wait(uint32_t msg, int sig, const char* phase_name) {
     // Step 2: Wait for ALL workers to report FINISH_MSG
     for (auto& w : workers) {
         while (!w.comm->is_finished()) {
+            if (kill(w.pid, 0) != 0 && errno == ESRCH) {
+                fprintf(stderr, "[%s] ERROR: worker %d exited while waiting\n",
+                        phase_name, w.pid);
+                exit(EXIT_FAILURE);
+            }
+            if (elapsed_sec(t0) * 1000.0 > control_timeout_ms()) {
+                fprintf(stderr,
+                        "[%s] ERROR: timed out after %ld ms waiting for worker %d\n",
+                        phase_name, control_timeout_ms(), w.pid);
+                exit(EXIT_FAILURE);
+            }
             usleep(1000);
         }
     }

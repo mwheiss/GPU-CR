@@ -34,8 +34,11 @@
 #define COPY_THRESHOLD (1UL << 29) // 0.5GB, when to copy from host_buf to shm
 #define NUM_COPY_THREADS 4
 #define CR_INIT_SIGNAL     SIGRTMAX
-#define CR_CKPT_SIGNAL     SIGUSR1
-#define CR_RESTORE_SIGNAL  SIGUSR2
+// Long-lived Python/vLLM services may replace SIGUSR1/SIGUSR2 after the
+// preload constructor runs. Keep every internal GPU-CR control message on a
+// dedicated realtime signal so the handler cannot silently disappear.
+#define CR_CKPT_SIGNAL     (SIGRTMAX - 4)
+#define CR_RESTORE_SIGNAL  (SIGRTMAX - 5)
 
 // Multi-GPU: IPC teardown/rebuild signals (real-time signals)
 // These replace the old NCCL suspend/resume signals.

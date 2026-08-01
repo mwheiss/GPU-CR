@@ -74,3 +74,13 @@ The preload resolver must obtain wrapped CUDA VMM functions with `RTLD_NEXT`.
 Resolving `cuMemCreate`, `cuMemUnmap`, or `cuMemRelease` through
 `RTLD_DEFAULT` can select the preload library's own exported wrapper and cause
 recursive controller calls during checkpoint teardown.
+
+All GPU-CR control messages use dedicated realtime signals on this branch.
+Persistent Python services, including vLLM, may install their own
+`SIGUSR1`/`SIGUSR2` handlers after `LD_PRELOAD` constructors run; using those
+traditional user signals can therefore terminate a worker or leave the
+coordinator waiting forever after IPC teardown.
+
+Coordinator waits are bounded by `GPU_CR_CONTROL_TIMEOUT_MS`, falling back to
+`GPU_CR_LOCK_TIMEOUT_MS` and then 600000 ms. A dead worker fails immediately;
+a lost control message cannot leave the model manager blocked indefinitely.
