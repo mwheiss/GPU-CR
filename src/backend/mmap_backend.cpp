@@ -32,6 +32,14 @@ static void reserve_file_capacity(int fd, off_t size, const char* path) {
     if (configured && (!strcmp(configured, "0") || !strcasecmp(configured, "false"))) {
         return;
     }
+    // In two-tier mode this file is only the coordinator/control mapping.  The
+    // allocation image is persisted with O_DIRECT to ckpt-N.bulk.data, so do
+    // not allocate a second 25 GiB extent that would never hold model bytes.
+    const char* async = std::getenv("GPU_CR_ASYNC_PERSIST");
+    if (async && strcmp(async, "0") && strcasecmp(async, "false") &&
+        strcasecmp(async, "no") && strcasecmp(async, "off")) {
+        size = HUGE_PAGE_SIZE;
+    }
     int rc = posix_fallocate(fd, 0, size);
     if (rc != 0) {
         fprintf(stderr, "posix_fallocate(%s, %lld) failed: %s\n",

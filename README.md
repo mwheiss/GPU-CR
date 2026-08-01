@@ -2,7 +2,9 @@
 
 > The `codex/betterissa-mmap-control` branch adds a fork-safe control thread,
 > bounded pinned bounce buffers, file-capacity reservation and driver-610
-> sequential job ordering for persistent vLLM servers. See
+> sequential job ordering for persistent vLLM servers. It also provides an
+> optional two-tier RAM/direct-I/O checkpoint path for low-latency switching.
+> See
 > [docs/betterissa-vllm.md](docs/betterissa-vllm.md).
 
 [![cuda](https://img.shields.io/badge/CUDA-supported-brightgreen.svg?logo=nvidia)]()
@@ -190,11 +192,20 @@ registration fails so a production service cannot silently enter the known
 slow pageable path.  Set `GPU_CR_ALLOW_PAGEABLE_STAGING=1` only as an explicit
 compatibility fallback; it may severely degrade checkpoint and restore times.
 
-The file-backed image uses `MAP_SHARED`.  Linux may write dirty pages to the
-configured filesystem while retaining the resulting clean pages in page cache,
-so hot restores can remain memory-speed and the pages can still be reclaimed
-under pressure.  GPU-CR does not call `fsync`; applications that require
-power-loss durability must add their own persistence barrier.
+The default file-backed image uses `MAP_SHARED`. Linux may write dirty pages to
+the configured filesystem while retaining the resulting clean pages in page
+cache. GPU-CR does not call `fsync`; applications that require power-loss
+durability must add their own persistence barrier.
+
+For low-latency model switching, set `GPU_CR_ASYNC_PERSIST=1`. The synchronous
+CUDA path copies VRAM into a prefaulted anonymous `mmap`, releases VRAM, and
+returns while a worker mirrors aligned chunks with `O_DIRECT` into
+`ckpt-N.bulk.data`. `GPU_CR_CHECKPOINT_CACHE_POLICY=keep` retains the RAM tier
+for fast restore; `pageout` calls `MADV_DONTNEED` after each chunk reaches the
+bulk file. Restore can consume a consistent disk-prefix/RAM-suffix image, so it
+does not wait for background persistence and a newer checkpoint cancels an
+obsolete mirror safely. The original `ckpt-N.data` remains a sparse control
+mapping for coordinator compatibility.
 
 ### 2. Single-GPU run + checkpoint
 

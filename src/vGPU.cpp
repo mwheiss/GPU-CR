@@ -6,6 +6,7 @@
 #include <cstring>
 #include <strings.h>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <thread>
 
@@ -41,6 +42,25 @@ Backend *backend;
 GPU *gpu;
 
 void* staging_buf[STAGING_BUF_NUM];
+
+// Optional two-tier checkpointing.  The synchronous CUDA path writes the
+// allocation image into anonymous RAM, releases VRAM, and returns.  A worker
+// then moves page-aligned chunks into the persistent backend.  Restore holds
+// g_persistence_io_mutex so it observes a stable split: the persisted prefix
+// comes from the file mapping and the remaining suffix comes from RAM.
+static void* g_ram_checkpoint = nullptr;
+static bool g_async_persist = false;
+static std::string g_cache_policy = "keep";
+static int g_cr_id = -1;
+static std::mutex g_persistence_io_mutex;
+static std::atomic<bool> g_persistence_cancel{false};
+static std::atomic<bool> g_restore_waiting{false};
+static std::atomic<bool> g_persistence_complete{false};
+static std::atomic<uint64_t> g_persisted_offset{0};
+static std::atomic<uint64_t> g_checkpoint_end{0};
+static std::thread* g_persistence_thread = nullptr;
+static std::mutex g_file_mapping_mutex;
+static bool g_file_data_mapped = true;
 
 bool CR_initialized = false;
 
@@ -152,6 +172,291 @@ void memcpy_multi(void* dest, void* src, size_t size) {
     }
 }
 
+static bool env_enabled(const char* name, bool default_value = false) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return default_value;
+    return !strcmp(value, "1") || !strcasecmp(value, "true") ||
+           !strcasecmp(value, "yes") || !strcasecmp(value, "on");
+}
+
+static void write_persistence_status(const char* state, uint64_t bytes,
+                                     const char* detail = nullptr) {
+    const char* root = std::getenv("EXPORT_FILE_PATH");
+    if (!root || g_cr_id < 0) return;
+    char path[768];
+    char temporary[800];
+    snprintf(path, sizeof(path), "%s/ckpt-%d.persist.json", root, g_cr_id);
+    snprintf(temporary, sizeof(temporary), "%s.tmp.%d", path, getpid());
+    int fd = open(temporary, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[vGPU-persist] open status failed: %s\n", strerror(errno));
+        return;
+    }
+    dprintf(fd,
+            "{\"state\":\"%s\",\"bytes\":%llu,\"end\":%llu,"
+            "\"pid\":%d,\"cache_policy\":\"%s\",\"detail\":\"%s\"}\n",
+            state, (unsigned long long)bytes,
+            (unsigned long long)g_checkpoint_end.load(std::memory_order_acquire),
+            getpid(), g_cache_policy.c_str(), detail ? detail : "");
+    close(fd);
+    if (rename(temporary, path) != 0) {
+        fprintf(stderr, "[vGPU-persist] rename status failed: %s\n", strerror(errno));
+        unlink(temporary);
+    }
+}
+
+static bool checkpoint_file_path(char* path, size_t size) {
+    const char* root = std::getenv("EXPORT_FILE_PATH");
+    if (!root || g_cr_id < 0) return false;
+    snprintf(path, size, "%s/ckpt-%d.data", root, g_cr_id);
+    return true;
+}
+
+static bool checkpoint_bulk_file_path(char* path, size_t size) {
+    const char* root = std::getenv("EXPORT_FILE_PATH");
+    if (!root || g_cr_id < 0) return false;
+    snprintf(path, size, "%s/ckpt-%d.bulk.data", root, g_cr_id);
+    return true;
+}
+
+static bool evict_persistent_file_cache(uint64_t end) {
+    const uint64_t start = ROUND_UP_2MB(sizeof(shared_mem_fs));
+    if (end <= start) return true;
+    const size_t length = SHM_SIZE - start;
+    char path[768];
+    if (!checkpoint_file_path(path, sizeof(path))) return false;
+
+    // Remove every PTE referencing the bulk file range, then reserve the same
+    // virtual addresses with an inaccessible anonymous mapping.  This lets
+    // POSIX_FADV_DONTNEED actually reclaim clean page-cache pages while keeping
+    // the address stable for a later MAP_FIXED remap.  The first 2 MiB remains
+    // file-backed because it contains GPU-CR's control metadata.
+    {
+        std::lock_guard<std::mutex> mapping_guard(g_file_mapping_mutex);
+        char* address = static_cast<char*>(backend->get_tmp_buf()) + start;
+        if (g_file_data_mapped && munmap(address, length) != 0) {
+            fprintf(stderr, "[vGPU-persist] persistent data unmap failed: %s\n",
+                    strerror(errno));
+            return false;
+        }
+        void* reservation = mmap(address, length, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                                     MAP_FIXED,
+                                 -1, 0);
+        if (reservation == MAP_FAILED || reservation != address) {
+            fprintf(stderr, "[vGPU-persist] address reservation failed: %s\n",
+                    strerror(errno));
+            return false;
+        }
+        g_file_data_mapped = false;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[vGPU-persist] open for fadvise failed: %s\n",
+                strerror(errno));
+        return false;
+    }
+    int rc = posix_fadvise(fd, start, end - start, POSIX_FADV_DONTNEED);
+    close(fd);
+    if (rc != 0) {
+        fprintf(stderr, "[vGPU-persist] POSIX_FADV_DONTNEED failed: %s\n",
+                strerror(rc));
+        return false;
+    }
+    fprintf(stderr,
+            "[vGPU-persist] Unmapped and invalidated persistent file cache for %llu bytes\n",
+            (unsigned long long)(end - start));
+    return true;
+}
+
+static bool direct_write_all(int fd, const void* buffer, size_t amount,
+                             uint64_t offset) {
+    const char* source = static_cast<const char*>(buffer);
+    size_t done = 0;
+    while (done < amount) {
+        ssize_t written = pwrite(fd, source + done, amount - done, offset + done);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            fprintf(stderr, "[vGPU-persist] direct pwrite failed at %llu: %s\n",
+                    (unsigned long long)(offset + done), strerror(errno));
+            return false;
+        }
+        done += written;
+    }
+    return true;
+}
+
+static bool direct_read_all(int fd, void* buffer, size_t amount,
+                            uint64_t offset) {
+    char* destination = static_cast<char*>(buffer);
+    size_t done = 0;
+    while (done < amount) {
+        ssize_t got = pread(fd, destination + done, amount - done, offset + done);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            fprintf(stderr, "[vGPU-restore] direct pread failed at %llu: %s\n",
+                    (unsigned long long)(offset + done), strerror(errno));
+            return false;
+        }
+        done += got;
+    }
+    return true;
+}
+
+static void persistence_worker() {
+    char* ram_image = static_cast<char*>(g_ram_checkpoint);
+    const uint64_t end = g_checkpoint_end.load(std::memory_order_acquire);
+    uint64_t offset = ROUND_UP_2MB(sizeof(shared_mem_fs));
+    auto started = std::chrono::steady_clock::now();
+    write_persistence_status("pending", offset);
+
+    char path[768];
+    if (!checkpoint_bulk_file_path(path, sizeof(path))) {
+        write_persistence_status("failed", offset, "file_path_missing");
+        return;
+    }
+    int direct_fd = open(path, O_CREAT | O_RDWR | O_DIRECT, 0644);
+    if (direct_fd < 0) {
+        fprintf(stderr, "[vGPU-persist] O_DIRECT open failed: %s\n", strerror(errno));
+        write_persistence_status("failed", offset, "direct_open_failed");
+        return;
+    }
+    if (ftruncate(direct_fd, end) != 0) {
+        fprintf(stderr, "[vGPU-persist] bulk ftruncate failed: %s\n",
+                strerror(errno));
+        close(direct_fd);
+        write_persistence_status("failed", offset, "bulk_truncate_failed");
+        return;
+    }
+    int allocation_rc = posix_fallocate(direct_fd, 0, end);
+    if (allocation_rc != 0) {
+        fprintf(stderr, "[vGPU-persist] bulk preallocation failed: %s\n",
+                strerror(allocation_rc));
+        close(direct_fd);
+        write_persistence_status("failed", offset, "bulk_preallocate_failed");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_persistence_io_mutex);
+        if (!evict_persistent_file_cache(end)) {
+            close(direct_fd);
+            write_persistence_status("failed", offset, "file_unmap_failed");
+            return;
+        }
+    }
+
+    while (offset < end) {
+        if (g_persistence_cancel.load(std::memory_order_acquire)) {
+            close(direct_fd);
+            write_persistence_status("cancelled", offset);
+            fprintf(stderr, "[vGPU-persist] Cancelled at %llu/%llu bytes\n",
+                    (unsigned long long)offset, (unsigned long long)end);
+            return;
+        }
+        while (g_restore_waiting.load(std::memory_order_acquire) &&
+               !g_persistence_cancel.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        size_t amount = std::min((uint64_t)STAGING_BUF_SIZE, end - offset);
+        {
+            // Restore holds this mutex for its complete host-to-device copy.
+            // A completed chunk is therefore switched from RAM to file
+            // atomically from restore's point of view.
+            std::lock_guard<std::mutex> guard(g_persistence_io_mutex);
+            if (g_persistence_cancel.load(std::memory_order_acquire)) continue;
+            if (!direct_write_all(direct_fd, ram_image + offset, amount, offset)) {
+                close(direct_fd);
+                write_persistence_status("failed", offset, "direct_write_failed");
+                return;
+            }
+            uint64_t new_offset = offset + amount;
+            g_persisted_offset.store(new_offset, std::memory_order_release);
+            if (g_cache_policy != "keep" &&
+                madvise(ram_image + offset, amount, MADV_DONTNEED) != 0) {
+                    fprintf(stderr,
+                            "[vGPU-persist] MADV_DONTNEED RAM chunk failed at %llu: %s\n",
+                            (unsigned long long)offset, strerror(errno));
+            }
+            offset = new_offset;
+        }
+    }
+    close(direct_fd);
+
+    g_persistence_complete.store(true, std::memory_order_release);
+    auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    fprintf(stderr,
+            "[vGPU-persist] Complete: %llu bytes in %.3f seconds (%.2f GiB/s)\n",
+            (unsigned long long)end, elapsed,
+            (end / (1024.0 * 1024.0 * 1024.0)) / elapsed);
+
+    // O_DIRECT bypasses page cache for the bulk image.  Re-issue the hint for
+    // metadata/tail pages without blocking the already-completed suspend.
+    bool cache_evicted = evict_persistent_file_cache(end);
+    fprintf(stderr, "[vGPU-persist] Cache policy applied: %s (file_evicted=%s)\n",
+            g_cache_policy.c_str(), cache_evicted ? "true" : "false");
+    write_persistence_status("complete", end,
+                             cache_evicted ? "file_cache_evicted" : "");
+}
+
+static void stop_persistence_worker() {
+    if (!g_persistence_thread) return;
+    g_persistence_cancel.store(true, std::memory_order_release);
+    if (g_persistence_thread->joinable()) g_persistence_thread->join();
+    delete g_persistence_thread;
+    g_persistence_thread = nullptr;
+    g_persistence_cancel.store(false, std::memory_order_release);
+    g_restore_waiting.store(false, std::memory_order_release);
+}
+
+static void start_persistence_worker(uint64_t end) {
+    g_checkpoint_end.store(end, std::memory_order_release);
+    g_persisted_offset.store(ROUND_UP_2MB(sizeof(shared_mem_fs)),
+                             std::memory_order_release);
+    g_persistence_complete.store(false, std::memory_order_release);
+    g_persistence_cancel.store(false, std::memory_order_release);
+    write_persistence_status("pending", g_persisted_offset.load());
+    g_persistence_thread = new std::thread(persistence_worker);
+}
+
+static bool ram_range_resident(uint64_t offset, size_t amount) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    size_t pages = (amount + page_size - 1) / page_size;
+    std::vector<unsigned char> residency(pages);
+    if (mincore(static_cast<char*>(g_ram_checkpoint) + offset, amount,
+                residency.data()) != 0) {
+        fprintf(stderr, "[vGPU-restore] mincore failed: %s\n", strerror(errno));
+        return false;
+    }
+    for (unsigned char value : residency) {
+        if (!(value & 1)) return false;
+    }
+    return true;
+}
+
+static void copy_checkpoint_chunk(void* destination, uint64_t offset,
+                                  size_t amount, int direct_fd,
+                                  uint64_t persisted_offset) {
+    if (!g_async_persist) {
+        memcpy_multi(destination,
+                     static_cast<char*>(backend->get_tmp_buf()) + offset,
+                     amount);
+        return;
+    }
+    bool use_ram = false;
+    bool must_use_ram = offset >= persisted_offset;
+    bool prefer_resident_ram = g_cache_policy == "keep" &&
+        ram_range_resident(offset, amount);
+    use_ram = must_use_ram || prefer_resident_ram;
+    if (use_ram) {
+        memcpy_multi(destination, static_cast<char*>(g_ram_checkpoint) + offset,
+                     amount);
+    } else if (!direct_read_all(direct_fd, destination, amount, offset)) {
+        exit(EXIT_FAILURE);
+    }
+}
+
 
 double ckpt() {
     fprintf(stderr, "[vGPU-CKPT] ckpt() entered, PID=%d\n", getpid());
@@ -162,7 +467,9 @@ double ckpt() {
     auto time_start = std::chrono::high_resolution_clock::now();
     long submit_time = 0, sync_time = 0, cpu_copy_time = 0, release_time = 0;
 
+    if (g_async_persist) stop_persistence_worker();
     void* tmp_buf = backend->get_tmp_buf();
+    void* checkpoint_data = g_async_persist ? g_ram_checkpoint : tmp_buf;
     fprintf(stderr, "[vGPU-CKPT] tmp_buf=%p\n", tmp_buf);
     fflush(stderr);
     shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
@@ -245,7 +552,7 @@ double ckpt() {
                     sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
                     
                     auto t5 = std::chrono::high_resolution_clock::now();
-                    memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+                    memcpy_multi((char*)checkpoint_data + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
                     auto t6 = std::chrono::high_resolution_clock::now();
                     cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
                     
@@ -264,7 +571,7 @@ double ckpt() {
         sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
         
         auto t5 = std::chrono::high_resolution_clock::now();
-        memcpy_multi((char*)fs + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
+        memcpy_multi((char*)checkpoint_data + des_offset, staging_buf[(current_buf - 1) & 1], STAGING_BUF_SIZE);
         auto t6 = std::chrono::high_resolution_clock::now();
         cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
         
@@ -277,7 +584,7 @@ double ckpt() {
     sync_time += std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
     
     auto t9 = std::chrono::high_resolution_clock::now();
-    memcpy_multi((char*)fs + des_offset, staging_buf[current_buf & 1], buf_offset);
+    memcpy_multi((char*)checkpoint_data + des_offset, staging_buf[current_buf & 1], buf_offset);
     auto t10 = std::chrono::high_resolution_clock::now();
     cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
     
@@ -299,6 +606,14 @@ double ckpt() {
     auto t12 = std::chrono::high_resolution_clock::now();
     release_time = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
     fprintf(stderr, "Physical GPU memory released, virtual addresses preserved\n");
+
+    if (g_async_persist) {
+        start_persistence_worker(fs->current_offset);
+        fprintf(stderr,
+                "[vGPU-CKPT] VRAM released; persistence continues in background "
+                "from anonymous RAM (%llu bytes)\n",
+                (unsigned long long)fs->current_offset);
+    }
     
 
     fprintf(stderr, "=== Checkpoint Timing Breakdown ===\n");
@@ -326,8 +641,35 @@ double restore_ptr_and_content() {
     void* tmp_buf = backend->get_tmp_buf();
     shared_mem_fs* fs = (shared_mem_fs*)tmp_buf;
 
+    // Freeze the RAM/file ownership boundary for the duration of restore.
+    // At most one 256 MiB persistence chunk must finish before this lock is
+    // acquired, so restore never waits for the complete disk image.
+    std::unique_lock<std::mutex> persistence_guard(
+        g_persistence_io_mutex, std::defer_lock);
+    if (g_async_persist) {
+        g_restore_waiting.store(true, std::memory_order_release);
+        persistence_guard.lock();
+        g_restore_waiting.store(false, std::memory_order_release);
+    }
+    uint64_t persisted_offset = g_async_persist
+        ? g_persisted_offset.load(std::memory_order_acquire)
+        : fs->current_offset;
+    fprintf(stderr, "[vGPU-restore] source boundary: file=%llu RAM=%llu bytes\n",
+            (unsigned long long)persisted_offset,
+            (unsigned long long)(fs->current_offset - persisted_offset));
+
     uint64_t file_num = fs->file_num;
     fprintf(stderr, "[vGPU-restore] restore %lu ptrs\n", file_num);
+    int direct_fd = -1;
+    if (g_async_persist) {
+        char path[768];
+        if (!checkpoint_bulk_file_path(path, sizeof(path)) ||
+            (direct_fd = open(path, O_RDONLY | O_DIRECT)) < 0) {
+            fprintf(stderr, "[vGPU-restore] O_DIRECT open failed: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+    }
     
     // Remap physical memory for all pointers before copying data
     fprintf(stderr, "[vGPU-restore] Remapping physical GPU memory for %lu pointers...\n", file_num);
@@ -370,7 +712,8 @@ double restore_ptr_and_content() {
             src_offset = fs->files[i].start_offset;
             size_t cpu_copy_size = std::min((size_t)(fs->current_offset - src_offset), (size_t)STAGING_BUF_SIZE);
             auto tc1 = std::chrono::high_resolution_clock::now();
-            memcpy_multi(staging_buf[current_buf & 1], (char*)fs + src_offset, cpu_copy_size);
+            copy_checkpoint_chunk(staging_buf[current_buf & 1], src_offset,
+                                  cpu_copy_size, direct_fd, persisted_offset);
             auto tc2 = std::chrono::high_resolution_clock::now();
             cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc2 - tc1).count();
             buf_offset = 0;
@@ -408,7 +751,9 @@ double restore_ptr_and_content() {
                 sync_time += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
                 
                 auto tc3 = std::chrono::high_resolution_clock::now();
-                memcpy_multi(staging_buf[(current_buf + 1) & 1], (char*)fs + src_offset, cpu_copy_size);
+                copy_checkpoint_chunk(staging_buf[(current_buf + 1) & 1],
+                                      src_offset, cpu_copy_size, direct_fd,
+                                      persisted_offset);
                 auto tc4 = std::chrono::high_resolution_clock::now();
                 cpu_copy_time += std::chrono::duration_cast<std::chrono::microseconds>(tc4 - tc3).count();
                 
@@ -426,6 +771,7 @@ double restore_ptr_and_content() {
     
     gpu->destroyStream(stream);
     gpu->destroyEvent(event);
+    if (direct_fd >= 0) close(direct_fd);
     
     fprintf(stderr, "=== Restore Timing Breakdown ===\n");
     fprintf(stderr, "  Remap memory:     %6ld ms\n", remap_time / 1000);
@@ -477,10 +823,52 @@ void init_CR() {
 
     fprintf(stderr, "[init_CR] Starting CR initialization...\n");
     int id = get_id();
+    g_cr_id = id;
     comm = new ShareMemComm(getpid());
     comm->setup();
     backend = new ShareMem(id);
     backend->setup();
+    g_async_persist = env_enabled("GPU_CR_ASYNC_PERSIST", false);
+    const char* cache_policy = std::getenv("GPU_CR_CHECKPOINT_CACHE_POLICY");
+    if (cache_policy && *cache_policy) g_cache_policy = cache_policy;
+    if (g_cache_policy != "keep" && g_cache_policy != "cold" &&
+        g_cache_policy != "pageout") {
+        fprintf(stderr, "[init_CR] Error: invalid GPU_CR_CHECKPOINT_CACHE_POLICY=%s\n",
+                g_cache_policy.c_str());
+        exit(EXIT_FAILURE);
+    }
+    if (g_async_persist) {
+        g_ram_checkpoint = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                -1, 0);
+        if (g_ram_checkpoint == MAP_FAILED) {
+            perror("[init_CR] mmap RAM checkpoint tier");
+            exit(EXIT_FAILURE);
+        }
+        (void)madvise(g_ram_checkpoint, SHM_SIZE, MADV_DONTDUMP);
+        if (env_enabled("GPU_CR_RAM_PREFAULT", true)) {
+            uint64_t needed = ROUND_UP_2MB(sizeof(shared_mem_fs));
+            for (const auto& entry : allocated_memory) {
+                needed += ROUND_UP_2MB(entry.second);
+            }
+            auto prefault_start = std::chrono::steady_clock::now();
+            if (madvise(static_cast<char*>(g_ram_checkpoint), needed,
+                        MADV_POPULATE_WRITE) != 0) {
+                fprintf(stderr, "[init_CR] RAM tier prefault failed: %s\n",
+                        strerror(errno));
+            } else {
+                auto prefault_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prefault_start).count();
+                fprintf(stderr,
+                        "[init_CR] Prefaulted %llu RAM-tier bytes in %.3f seconds\n",
+                        (unsigned long long)needed, prefault_seconds);
+            }
+        }
+        fprintf(stderr,
+                "[init_CR] Two-tier checkpointing enabled: RAM=%p size=%lu "
+                "cache_policy=%s\n",
+                g_ram_checkpoint, SHM_SIZE, g_cache_policy.c_str());
+    }
     gpu = createGPU();  // createGPU() will detect the GPU vendor and return the appropriate GPU object
     fprintf(stderr, "[init_CR] GPU vendor: %s\n", gpu->getVendorName().c_str());
     fprintf(stderr, "[init_CR] Allocating staging buffer (%zu MB)...\n", 

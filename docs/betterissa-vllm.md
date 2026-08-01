@@ -13,10 +13,28 @@ required by vLLM V1 when its EngineCore worker uses the `fork` start method.
 
 ## File-backed memory
 
-Set `EXPORT_FILE_PATH` to a directory on a regular filesystem. The primary
-checkpoint and bounce-buffer files are mapped `MAP_SHARED`. The primary file
-is pageable and may be written back and reclaimed by Linux. Only the two
+Set `EXPORT_FILE_PATH` to a directory on a regular filesystem. Only the two
 transfer bounce buffers are registered with CUDA as pinned memory.
+
+With `GPU_CR_ASYNC_PERSIST=1`, checkpointing uses two host tiers:
+
+- a prefaulted anonymous `mmap` receives the synchronous GPU copy;
+- `ckpt-N.bulk.data` receives an aligned background `O_DIRECT` mirror.
+
+VRAM is released as soon as the first copy finishes. A restore locks the
+current persistence boundary and reads each chunk from RAM or disk, so it can
+preempt persistence without observing a mixed generation. Starting another
+checkpoint cancels the obsolete mirror at a chunk boundary. The coordinator's
+`ckpt-N.data` remains mapped, but only its first 2 MiB is physically allocated;
+the unused bulk range is replaced with an inaccessible address reservation.
+
+`GPU_CR_CHECKPOINT_CACHE_POLICY=keep` is appropriate for a frequently restored
+primary model. It retains the RAM copy and uses the bulk file as recovery
+backing. `pageout` is appropriate for a rare fallback: every RAM chunk receives
+`MADV_DONTNEED` after the direct write completes, so a later restore reads the
+bulk file at the volume's sustained direct-read rate. The backing filesystem
+must support aligned `O_DIRECT`; failure is reported in
+`ckpt-N.persist.json` and should trigger the manager's cold-restart fallback.
 
 The bounce-buffer size is selected at build time:
 
@@ -35,11 +53,13 @@ preload library and coordinators. Static libstdc++ linking does not solve a
 newer host glibc dependency; `GPU_CR_STATIC_CXX_RUNTIME` therefore defaults
 off and is only an explicit packaging option.
 
-File capacity is reserved with `posix_fallocate()` before mmap by default so a
-checkpoint cannot fail late with `SIGBUS` or `ENOSPC`. Set
-`GPU_CR_FILE_PREALLOCATE=0` only when sparse allocation is explicitly desired.
-This does not call `fsync`; normal checkpoint completion means the image is in
-the shared filesystem mapping and may still contain dirty page-cache pages.
+File capacity is reserved with `posix_fallocate()` before use. In two-tier mode
+the control file reserves 2 MiB and the bulk sidecar reserves exactly the
+meaningful allocation image; the legacy synchronous mode reserves the complete
+mapped image. Set `GPU_CR_FILE_PREALLOCATE=0` only when sparse allocation is
+explicitly desired. GPU-CR does not call `fsync`. A completed direct write is
+available for restore, but power loss can still require a cold start and a new
+checkpoint.
 
 ## NVIDIA control checkpoint
 
@@ -52,7 +72,7 @@ For the BetterIssa single-GPU vLLM profile, the expected sequence is:
 
 ```text
 quiesce requests
-GPU data -> mapped file and release physical allocations
+GPU data -> RAM mmap, release physical allocations, direct background mirror
 CUDA lock -> checkpoint
 CUDA restore -> unlock
 remap allocations and mapped file -> GPU
