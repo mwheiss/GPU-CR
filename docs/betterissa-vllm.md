@@ -29,6 +29,12 @@ cmake -S . -B build \
 cmake --build build -j
 ```
 
+Build with a userspace ABI no newer than the target vLLM container. BetterIssa
+uses `nvidia/cuda:13.0.2-devel-ubuntu22.04` (GCC 11, glibc 2.35) for both the
+preload library and coordinators. Static libstdc++ linking does not solve a
+newer host glibc dependency; `GPU_CR_STATIC_CXX_RUNTIME` therefore defaults
+off and is only an explicit packaging option.
+
 File capacity is reserved with `posix_fallocate()` before mmap by default so a
 checkpoint cannot fail late with `SIGBUS` or `ENOSPC`. Set
 `GPU_CR_FILE_PREALLOCATE=0` only when sparse allocation is explicitly desired.

@@ -57,6 +57,8 @@ message(STATUS "Pinned staging buffer size = 2 x ${STAGING_BUF_MB} MiB")
 # ---------------------------------------------------------------------------
 option(GPU_CR_BUILD_NCCL_ADAPTER    "Build the NCCL checkpoint adapter (plugin + runtime)" OFF)
 option(GPU_CR_BUILD_NVSHMEM_ADAPTER "Build the NVSHMEM checkpoint examples"                OFF)
+option(GPU_CR_STATIC_CXX_RUNTIME
+       "Link libstdc++/libgcc into binaries (does not lower the glibc baseline)" OFF)
 
 # ---------------------------------------------------------------------------
 # Core LD_PRELOAD library: vGPU-${GPU_VENDOR}.so
@@ -100,9 +102,12 @@ target_include_directories(vGPU PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_directories(vGPU PRIVATE ${GPU_LIB_DIR})
-target_link_libraries(vGPU PRIVATE ${GPU_LIBS} dl stdc++ pthread)
+target_link_libraries(vGPU PRIVATE ${GPU_LIBS} dl pthread)
 target_compile_options(vGPU PRIVATE -fPIC -O3 -g)
 target_link_options(vGPU PRIVATE -shared -fPIC)
+if(GPU_CR_STATIC_CXX_RUNTIME)
+    target_link_options(vGPU PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # ---------------------------------------------------------------------------
 # Coordinator CLIs
@@ -123,8 +128,11 @@ target_include_directories(cr_client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_directories(cr_client PRIVATE ${GPU_LIB_DIR})
-target_link_libraries(cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
+target_link_libraries(cr_client PRIVATE ${GPU_LIBS} dl pthread)
 target_compile_options(cr_client PRIVATE -O3 -g)
+if(GPU_CR_STATIC_CXX_RUNTIME)
+    target_link_options(cr_client PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 add_executable(multi_cr_client
     ${CMAKE_CURRENT_SOURCE_DIR}/coordinator/multi_cr_client.cpp
@@ -135,8 +143,11 @@ target_include_directories(multi_cr_client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_directories(multi_cr_client PRIVATE ${GPU_LIB_DIR})
-target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl stdc++ pthread)
+target_link_libraries(multi_cr_client PRIVATE ${GPU_LIBS} dl pthread)
 target_compile_options(multi_cr_client PRIVATE -O3 -g)
+if(GPU_CR_STATIC_CXX_RUNTIME)
+    target_link_options(multi_cr_client PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional adapters (only meaningful on NVIDIA)
