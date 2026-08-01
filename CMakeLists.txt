@@ -47,6 +47,11 @@ if(DEFINED SHM_SIZE_GB)
     message(STATUS "Per-worker SHM_SIZE_GB = ${SHM_SIZE_GB}")
 endif()
 
+set(STAGING_BUF_MB 256 CACHE STRING
+    "Size in MiB of each of the two pinned GPU transfer bounce buffers")
+add_compile_definitions(STAGING_BUF_MB=${STAGING_BUF_MB})
+message(STATUS "Pinned staging buffer size = 2 x ${STAGING_BUF_MB} MiB")
+
 # ---------------------------------------------------------------------------
 # Optional adapter build flags
 # ---------------------------------------------------------------------------

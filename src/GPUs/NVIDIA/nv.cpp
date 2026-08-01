@@ -266,6 +266,7 @@ int nv::externalRestore(int pid) {
 // ========== hook functions implementation ==========
 
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
+    gpu_cr_ensure_control_thread();
     fprintf(stderr, "[HOOK] cudaMalloc called! size=%zu\n", size);
     fflush(stderr);
 
@@ -388,6 +389,7 @@ extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 extern "C" cudaError_t cudaFree(void* ptr) {
+    gpu_cr_ensure_control_thread();
     fprintf(stderr, "[HOOK] cudaFree(%p)\n", ptr);
     fflush(stderr);
     

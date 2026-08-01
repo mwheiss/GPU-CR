@@ -20,6 +20,7 @@
 
 #include "ipc_hooks.h"
 #include "ipc_fd_exchange.h"
+#include "common.h"
 
 #include <cuda.h>
 // Prevent the CUDA 11 header's 3-param declaration of cudaGetDriverEntryPoint
@@ -354,6 +355,7 @@ static CUresult CUDAAPI hook_cuMemCreate(
     CUmemGenericAllocationHandle* handle, size_t size,
     const CUmemAllocationProp* prop, unsigned long long flags)
 {
+    gpu_cr_ensure_control_thread();
     if (!real_cuMemCreate) {
         fprintf(stderr, "[IPC-HOOK] ERROR: real cuMemCreate not available\n");
         return CUDA_ERROR_NOT_INITIALIZED;

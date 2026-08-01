@@ -9,6 +9,7 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -41,6 +42,97 @@ GPU *gpu;
 void* staging_buf[STAGING_BUF_NUM];
 
 bool CR_initialized = false;
+
+static void handle_cr_signal(int signum);
+static void handle_ipc_signal(int signum);
+
+static std::mutex control_thread_mutex;
+static pid_t control_thread_pid = -1;
+static int control_pipe[2] = {-1, -1};
+
+static void* control_thread_main(void*) {
+    for (;;) {
+        int signum = 0;
+        ssize_t got = read(control_pipe[0], &signum, sizeof(signum));
+        if (got == (ssize_t)sizeof(signum)) {
+            if (signum == CR_INIT_SIGNAL || signum == CR_CKPT_SIGNAL ||
+                signum == CR_RESTORE_SIGNAL) {
+                handle_cr_signal(signum);
+            } else if (signum == CR_IPC_TEARDOWN_SIGNAL ||
+                       signum == CR_IPC_REBUILD_SIGNAL) {
+                handle_ipc_signal(signum);
+            } else if (signum == CR_IPC_VALIDATE_SIGNAL) {
+                ipc_validate_all_mappings("ON-DEMAND");
+                fflush(stderr);
+            }
+            continue;
+        }
+        if (got < 0 && errno == EINTR) continue;
+        break;
+    }
+    return nullptr;
+}
+
+void gpu_cr_ensure_control_thread(void) {
+    const pid_t self = getpid();
+    std::lock_guard<std::mutex> guard(control_thread_mutex);
+    if (control_thread_pid == self && control_pipe[1] >= 0) return;
+
+    // A vLLM worker may be forked after the preload constructor ran.  Threads
+    // do not survive fork, so discard the inherited pipe and create a worker-
+    // local controller when an allocation hook first runs in the child.
+    if (control_pipe[0] >= 0) close(control_pipe[0]);
+    if (control_pipe[1] >= 0) close(control_pipe[1]);
+    control_pipe[0] = control_pipe[1] = -1;
+
+    if (pipe2(control_pipe, O_CLOEXEC) != 0) {
+        perror("[vGPU] pipe2 control channel");
+        return;
+    }
+    int flags = fcntl(control_pipe[1], F_GETFL, 0);
+    if (flags >= 0) fcntl(control_pipe[1], F_SETFL, flags | O_NONBLOCK);
+
+    pthread_t thread;
+    int rc = pthread_create(&thread, nullptr, control_thread_main, nullptr);
+    if (rc != 0) {
+        errno = rc;
+        perror("[vGPU] pthread_create control thread");
+        close(control_pipe[0]);
+        close(control_pipe[1]);
+        control_pipe[0] = control_pipe[1] = -1;
+        return;
+    }
+    pthread_detach(thread);
+    control_thread_pid = self;
+    fprintf(stderr, "[vGPU] Control thread ready for PID %d\n", self);
+}
+
+static void queue_control_signal(int signum) {
+    int saved_errno = errno;
+    int fd = control_pipe[1];
+    if (fd >= 0) {
+        // write(2) is async-signal-safe.  Control operations are serialized by
+        // the manager, so a full pipe indicates a genuine protocol failure.
+        (void)write(fd, &signum, sizeof(signum));
+    }
+    errno = saved_errno;
+}
+
+static void control_atfork_prepare(void) {
+    control_thread_mutex.lock();
+}
+
+static void control_atfork_parent(void) {
+    control_thread_mutex.unlock();
+}
+
+static void control_atfork_child(void) {
+    if (control_pipe[0] >= 0) close(control_pipe[0]);
+    if (control_pipe[1] >= 0) close(control_pipe[1]);
+    control_pipe[0] = control_pipe[1] = -1;
+    control_thread_pid = -1;
+    control_thread_mutex.unlock();
+}
 
 // Helper function: multi-threaded memcpy
 void memcpy_multi(void* dest, void* src, size_t size) {
@@ -402,7 +494,7 @@ void init_CR() {
     fprintf(stderr, "[init_CR] Initialization complete, setting CR_initialized = true\n");
 }
 
-void cr_signal_handler(int signum) {
+static void handle_cr_signal(int signum) {
     fprintf(stderr, "[vGPU] Received signal %d from process %d\n", signum, getpid());
     fflush(stderr);
     
@@ -478,7 +570,7 @@ void cr_signal_handler(int signum) {
 // IPC teardown/rebuild signal handler (for multi-GPU checkpoint/restore)
 // Replaces the old NCCL suspend/resume handler — no NCCL source mods needed.
 // ---------------------------------------------------------------------------
-void cr_ipc_signal_handler(int signum) {
+static void handle_ipc_signal(int signum) {
     fprintf(stderr, "[vGPU-IPC] Received signal %d (PID=%d)\n", signum, getpid());
     fflush(stderr);
 
@@ -733,18 +825,20 @@ __attribute__((constructor)) void init() {
     fprintf(stderr, "[vGPU] Multi-GPU CR support enabled (IPC hook mode)\n");
     fflush(stderr);
 
-    // Original single-GPU signals
-    signal(CR_INIT_SIGNAL, cr_signal_handler);
-    signal(CR_CKPT_SIGNAL, cr_signal_handler);
-    signal(CR_RESTORE_SIGNAL, cr_signal_handler);
+    pthread_atfork(control_atfork_prepare, control_atfork_parent,
+                   control_atfork_child);
+    gpu_cr_ensure_control_thread();
+
+    // Signal handlers only enqueue a small integer.  mmap, allocation, CUDA,
+    // mutex, logging and coordinator communication all run on the controller.
+    signal(CR_INIT_SIGNAL, queue_control_signal);
+    signal(CR_CKPT_SIGNAL, queue_control_signal);
+    signal(CR_RESTORE_SIGNAL, queue_control_signal);
 
     // Multi-GPU IPC teardown/rebuild signals (replaces NCCL suspend/resume)
-    signal(CR_IPC_TEARDOWN_SIGNAL, cr_ipc_signal_handler);
-    signal(CR_IPC_REBUILD_SIGNAL, cr_ipc_signal_handler);
+    signal(CR_IPC_TEARDOWN_SIGNAL, queue_control_signal);
+    signal(CR_IPC_REBUILD_SIGNAL, queue_control_signal);
 
     // Diagnostic: validate all IPC mappings on demand
-    signal(CR_IPC_VALIDATE_SIGNAL, [](int) {
-        ipc_validate_all_mappings("ON-DEMAND");
-        fflush(stderr);
-    });
+    signal(CR_IPC_VALIDATE_SIGNAL, queue_control_signal);
 }

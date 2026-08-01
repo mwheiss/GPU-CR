@@ -1,5 +1,10 @@
 <h1 align="center">GPU-CR: GPU Checkpoint & Restore</h1>
 
+> The `codex/betterissa-mmap-control` branch adds a fork-safe control thread,
+> bounded pinned bounce buffers, file-capacity reservation and driver-610
+> sequential job ordering for persistent vLLM servers. See
+> [docs/betterissa-vllm.md](docs/betterissa-vllm.md).
+
 [![cuda](https://img.shields.io/badge/CUDA-supported-brightgreen.svg?logo=nvidia)]()
 [![rocm](https://img.shields.io/badge/ROCm-supported-brightgreen.svg?logo=amd)]()
 [![ascend](https://img.shields.io/badge/Ascend-Developing-lightgrey.svg?logo=huawei)]()

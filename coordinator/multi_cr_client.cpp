@@ -460,7 +460,10 @@ static int cuda_checkpoint_toggle_all(const char* phase_name, bool buffer_only) 
         return (int)workers.size();
     }
     auto t0 = std::chrono::high_resolution_clock::now();
-    int failures = cuda_ckpt_all_parallel("--toggle", phase_name);
+    // Driver 610 checkpoint jobs currently require per-process operations to
+    // be invoked sequentially.  Data copies still run concurrently in the
+    // workers; only the driver control pass is serialized.
+    int failures = cuda_ckpt_all("--toggle", phase_name);
     printf("[%s] All %zu workers toggled (%d failures, %.3f s total)\n",
            phase_name, workers.size(), failures, elapsed_sec(t0));
     return failures;
@@ -486,25 +489,28 @@ static int cuda_checkpoint_freeze_action(const char* phase_name, bool buffer_onl
     auto t0 = std::chrono::high_resolution_clock::now();
     int failures = 0;
 
-    // Step 1: Lock all workers IN PARALLEL (prevent new CUDA work)
-    printf("[%s] Step 1: Lock all workers (parallel)...\n", phase_name);
-    failures = cuda_ckpt_all_parallel("--action lock", phase_name);
+    // Lock every member before checkpointing any.  Keep the driver operations
+    // sequential for driver-610 job/IPC compatibility.
+    const char* timeout = std::getenv("GPU_CR_LOCK_TIMEOUT_MS");
+    std::string lock_args = "--action lock --timeout ";
+    lock_args += timeout ? timeout : "600000";
+    printf("[%s] Step 1: Lock all workers (sequential)...\n", phase_name);
+    failures = cuda_ckpt_all(lock_args.c_str(), phase_name);
     if (failures > 0) {
         fprintf(stderr, "[%s] Lock failed for %d worker(s), aborting freeze\n",
                 phase_name, failures);
         // Unlock any that succeeded
-        cuda_ckpt_all_parallel("--action unlock", phase_name);
+        cuda_ckpt_all("--action unlock", phase_name);
         return failures;
     }
 
-    // Step 2: Checkpoint all workers IN PARALLEL (save CUDA state)
-    printf("[%s] Step 2: Checkpoint all workers (parallel)...\n", phase_name);
-    failures = cuda_ckpt_all_parallel("--action checkpoint", phase_name);
+    printf("[%s] Step 2: Checkpoint all workers (sequential)...\n", phase_name);
+    failures = cuda_ckpt_all("--action checkpoint", phase_name);
     if (failures > 0) {
         fprintf(stderr, "[%s] Checkpoint failed for %d worker(s)\n",
                 phase_name, failures);
         // Try to unlock the ones that were locked
-        cuda_ckpt_all_parallel("--action unlock", phase_name);
+        cuda_ckpt_all("--action unlock", phase_name);
         return failures;
     }
 
@@ -531,17 +537,15 @@ static int cuda_checkpoint_restore_action(const char* phase_name, bool buffer_on
     auto t0 = std::chrono::high_resolution_clock::now();
     int failures = 0;
 
-    // Step 1: Restore all workers IN PARALLEL (recreate CUDA state)
-    printf("[%s] Step 1: Restore all workers (parallel)...\n", phase_name);
-    failures = cuda_ckpt_all_parallel("--action restore", phase_name);
+    printf("[%s] Step 1: Restore all workers (sequential)...\n", phase_name);
+    failures = cuda_ckpt_all("--action restore", phase_name);
     if (failures > 0) {
         fprintf(stderr, "[%s] Restore failed for %d worker(s)\n",
                 phase_name, failures);
     }
 
-    // Step 2: Unlock all workers IN PARALLEL (resume CUDA operations)
-    printf("[%s] Step 2: Unlock all workers (parallel)...\n", phase_name);
-    int unlock_failures = cuda_ckpt_all_parallel("--action unlock", phase_name);
+    printf("[%s] Step 2: Unlock all workers (sequential)...\n", phase_name);
+    int unlock_failures = cuda_ckpt_all("--action unlock", phase_name);
     failures += unlock_failures;
 
     printf("[%s] All %zu workers restored via --action mode (%d failures, %.3f s)\n",

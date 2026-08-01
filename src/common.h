@@ -50,7 +50,10 @@
 // Maximum number of processes in multi-GPU checkpoint
 #define MAX_MULTI_GPU_PROCS 32
 
-#define STAGING_BUF_SIZE (1UL << 30) // 1GB staging buffer
+#ifndef STAGING_BUF_MB
+#define STAGING_BUF_MB 256
+#endif
+#define STAGING_BUF_SIZE ((unsigned long)STAGING_BUF_MB << 20)
 #define STAGING_BUF_NUM 2
 
 typedef void (*sighandler_t)(int);
@@ -64,6 +67,12 @@ extern std::map<void*, int> allocated_memory_type;
 
 // Helper function declarations
 void memcpy_multi(void* dest, void* src, size_t size);
+
+// Heavy checkpoint work must never run in a POSIX signal handler.  The
+// preload library routes control signals through a pipe to a dedicated
+// thread.  Allocation hooks call this after fork so vLLM worker children get
+// their own controller (threads do not survive fork()).
+void gpu_cr_ensure_control_thread(void);
 
 struct shared_mem_file {
     void* ptr;

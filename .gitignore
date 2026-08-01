@@ -1,6 +1,7 @@
 # Build outputs
 build/
 build_*/
+build-*/
 cmake-build-*/
 out/
 

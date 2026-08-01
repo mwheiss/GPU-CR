@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <cstring>
+#include <strings.h>
 
 #include "../common.h"
 #include "backend.h"
@@ -23,6 +25,19 @@ ShareMem::ShareMem(int id) : Backend(id), id(id) {
 }
 
 ShareMem::~ShareMem() {
+}
+
+static void reserve_file_capacity(int fd, off_t size, const char* path) {
+    const char* configured = std::getenv("GPU_CR_FILE_PREALLOCATE");
+    if (configured && (!strcmp(configured, "0") || !strcasecmp(configured, "false"))) {
+        return;
+    }
+    int rc = posix_fallocate(fd, 0, size);
+    if (rc != 0) {
+        fprintf(stderr, "posix_fallocate(%s, %lld) failed: %s\n",
+                path, (long long)size, strerror(rc));
+        exit(EXIT_FAILURE);
+    }
 }
 
 void ShareMem::setup() {
@@ -45,12 +60,14 @@ void ShareMem::setup() {
             perror("ftruncate() file backend");
             exit(EXIT_FAILURE);
         }
+        reserve_file_capacity(fd, SHM_SIZE, shm_name);
 
         tmp_buf = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (tmp_buf == MAP_FAILED) {
             perror("mmap file backend failed");
             exit(EXIT_FAILURE);
         }
+        close(fd);
     }
     else{
         sprintf(shm_name, "/mnt/huge-ckpt/%d", id);
@@ -100,12 +117,17 @@ void ShareMem::setup() {
         perror("ftruncate() host mem");
         exit(EXIT_FAILURE);
     }
+    if (use_file_backend) {
+        reserve_file_capacity(fd_host, host_buf_total_size, shm_name);
+    }
 
     host_buf_ptr = mmap(NULL, host_buf_total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_host, 0);
     if (host_buf_ptr == MAP_FAILED) {
         perror("mmap host mem failed");
         exit(EXIT_FAILURE);
     }
+    close(fd_host);
+    fd_host = -1;
     fprintf(stderr, "[ShareMem] Host memory mapped at %p (size: %zu)\n", host_buf_ptr, host_buf_total_size);
 
     
