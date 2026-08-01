@@ -12,13 +12,16 @@
 
 GPU* createGPU() {
     const char* vendor = getenv("GPU_VENDOR");
-    
+
     if (!vendor) {
-        fprintf(stderr, "[GPU Factory] ERROR: GPU_VENDOR environment variable not set!\n");
-        fprintf(stderr, "[GPU Factory] Please set: export GPU_VENDOR=NVIDIA  or  export GPU_VENDOR=AMD\n");
-        exit(EXIT_FAILURE);
+#ifdef __HIP_PLATFORM_AMD__
+        vendor = "AMD";
+#else
+        vendor = "NVIDIA";
+#endif
+        fprintf(stderr, "[GPU Factory] GPU_VENDOR not set; using build target %s\n", vendor);
     }
-    
+
 #ifdef __HIP_PLATFORM_AMD__
     if (strcasecmp(vendor, "AMD") == 0 || strcasecmp(vendor, "ROCM") == 0 || strcasecmp(vendor, "HIP") == 0) {
         fprintf(stderr, "[GPU Factory] Creating AMD GPU instance\n");

@@ -62,3 +62,10 @@ real inference readiness check
 The application manager must validate process identity, VRAM availability and
 inference output around every transition. A failed partial transition must be
 rolled back or cold-restarted; a checkpoint error is not safe to ignore.
+
+`GPU_VENDOR` may be set explicitly in the managed process environment. When it
+is absent, the runtime now selects the backend compiled into the preload
+library (NVIDIA for a CUDA build, AMD for a HIP build). This matters for
+services launched through an environment-sanitizing supervisor: selecting the
+already-fixed build target must not terminate the long-lived worker during its
+first checkpoint initialization.
