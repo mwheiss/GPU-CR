@@ -69,3 +69,8 @@ library (NVIDIA for a CUDA build, AMD for a HIP build). This matters for
 services launched through an environment-sanitizing supervisor: selecting the
 already-fixed build target must not terminate the long-lived worker during its
 first checkpoint initialization.
+
+The preload resolver must obtain wrapped CUDA VMM functions with `RTLD_NEXT`.
+Resolving `cuMemCreate`, `cuMemUnmap`, or `cuMemRelease` through
+`RTLD_DEFAULT` can select the preload library's own exported wrapper and cause
+recursive controller calls during checkpoint teardown.

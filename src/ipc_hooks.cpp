@@ -220,7 +220,10 @@ static CUresult CUDAAPI hook_cuMemSetAccess(
     CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
 
 static void resolve_helper_fns() {
-    if (!fn_cuMemRelease) fn_cuMemRelease = (cuMemRelease_fn)dlsym(RTLD_DEFAULT, "cuMemRelease");
+    // The preload library exports wrappers for these VMM entry points. Using
+    // RTLD_DEFAULT here can resolve back to our own wrapper and recurse until
+    // the controller thread segfaults during its first cuMemUnmap/Release.
+    if (!fn_cuMemRelease) fn_cuMemRelease = (cuMemRelease_fn)dlsym(RTLD_NEXT, "cuMemRelease");
     if (!fn_cuMemAddressReserve) fn_cuMemAddressReserve = (cuMemAddressReserve_fn)dlsym(RTLD_DEFAULT, "cuMemAddressReserve");
     if (!fn_cuMemAddressFree) fn_cuMemAddressFree = (cuMemAddressFree_fn)dlsym(RTLD_DEFAULT, "cuMemAddressFree");
     if (!fn_cuMemRetainAllocationHandle) fn_cuMemRetainAllocationHandle = (cuMemRetainAllocationHandle_fn)dlsym(RTLD_DEFAULT, "cuMemRetainAllocationHandle");
@@ -228,7 +231,7 @@ static void resolve_helper_fns() {
     if (!fn_cuMemcpyDtoH) fn_cuMemcpyDtoH = (cuMemcpyDtoH_fn)dlsym(RTLD_DEFAULT, "cuMemcpyDtoH");
     if (!fn_cuMemcpyHtoD) fn_cuMemcpyHtoD = (cuMemcpyHtoD_fn)dlsym(RTLD_DEFAULT, "cuMemcpyHtoD_v2");
     if (!fn_cuMemcpyHtoD) fn_cuMemcpyHtoD = (cuMemcpyHtoD_fn)dlsym(RTLD_DEFAULT, "cuMemcpyHtoD");
-    if (!real_cuMemCreate) real_cuMemCreate = (cuMemCreate_fn)dlsym(RTLD_DEFAULT, "cuMemCreate");
+    if (!real_cuMemCreate) real_cuMemCreate = (cuMemCreate_fn)dlsym(RTLD_NEXT, "cuMemCreate");
     if (!fn_cuCtxSetCurrent) fn_cuCtxSetCurrent = (cuCtxSetCurrent_fn)dlsym(RTLD_DEFAULT, "cuCtxSetCurrent");
     if (!fn_cuCtxGetCurrent) fn_cuCtxGetCurrent = (cuCtxGetCurrent_fn)dlsym(RTLD_DEFAULT, "cuCtxGetCurrent");
     if (!fn_cuDevicePrimaryCtxRetain) fn_cuDevicePrimaryCtxRetain = (cuDevicePrimaryCtxRetain_fn)dlsym(RTLD_DEFAULT, "cuDevicePrimaryCtxRetain");
@@ -751,7 +754,11 @@ extern "C" void* dlsym(void* handle, const char* symbol) {
         for (int i = 0; g_hook_table[i].symbol != nullptr; i++) {
             if (strcmp(symbol, g_hook_table[i].symbol) == 0) {
                 g_inside_dlsym_hook = true;
-                void* real_symbol = real_dlsym(handle, symbol);
+                // Always resolve the implementation after this preload
+                // library. RTLD_DEFAULT would select our exported wrapper for
+                // symbols such as cuMemUnmap, turning the saved "real"
+                // function pointer into a recursive self-call.
+                void* real_symbol = real_dlsym(RTLD_NEXT, symbol);
                 g_inside_dlsym_hook = false;
                 if (real_symbol) {
                     *(g_hook_table[i].real_fn_storage) = real_symbol;
@@ -1163,7 +1170,7 @@ int ipc_teardown_all_imports() {
     auto t_total = std::chrono::high_resolution_clock::now();
 
     if (!real_cuMemUnmap)
-        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_DEFAULT, "cuMemUnmap");
+        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_NEXT, "cuMemUnmap");
     if (!fn_cuMemRelease) {
         fprintf(stderr, "[IPC-HOOK] ERROR: cuMemRelease not resolved\n");
         return -1;
@@ -1234,7 +1241,7 @@ int ipc_save_and_teardown_all_exports(void* host_buf, size_t buf_size) {
     resolve_helper_fns();
 
     if (!real_cuMemUnmap)
-        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_DEFAULT, "cuMemUnmap");
+        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_NEXT, "cuMemUnmap");
 
     if (!fn_cuMemRelease || !fn_cuMemcpyDtoH) {
         fprintf(stderr, "[IPC-HOOK] ERROR: required functions not resolved for export teardown\n");
@@ -1709,7 +1716,7 @@ int ipc_save_and_teardown_local_allocs(void* host_buf, size_t buf_size) {
     resolve_helper_fns();
 
     if (!real_cuMemUnmap)
-        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_DEFAULT, "cuMemUnmap");
+        real_cuMemUnmap = (cuMemUnmap_fn)dlsym(RTLD_NEXT, "cuMemUnmap");
     if (!fn_cuMemRelease || !fn_cuMemcpyDtoH) {
         fprintf(stderr, "[IPC-HOOK] ERROR: required functions not resolved for local alloc teardown\n");
         return -1;
